@@ -36,7 +36,7 @@ use std::sync::mpsc;
 use std::sync::mpsc::channel;
 
 
-
+const DATA_FOLDER: &str = "data/";
 const DATA_PATH: &str = "data/testdataPartDL.json";
 const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
@@ -48,7 +48,12 @@ pub struct DataDownloadingState {
 }
 
 pub struct DataDownloadingStateSender {
-    pub sender: std::sync::mpsc::Sender<bool>
+    pub sender: std::sync::mpsc::Sender<KLineDatas>
+}
+
+pub struct KLineDatas {
+    pub interval: String, 
+    pub symbol: String
 }
 
 struct ParamMultiplier {
@@ -170,7 +175,7 @@ pub async fn kline_data_dl_handler(data_dl_state: &State<std::sync::Arc<std::syn
         }));
     }
     
-    sender_state.lock().unwrap().sender.send(true);
+    sender_state.lock().unwrap().sender.send(KLineDatas { interval: "1m".to_string(), symbol: "BNBUSDT".to_string() });
 
     let message: String = format!("Downloading kline datas : ");
     let response_json = GenericResponse {
@@ -181,9 +186,9 @@ pub async fn kline_data_dl_handler(data_dl_state: &State<std::sync::Arc<std::syn
     Ok(Json(response_json))
 }
 
-fn kline_dl_manager(data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownloadingState>>, rx: &Receiver<bool>) {
+fn kline_dl_manager(data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownloadingState>>, rx: &Receiver<KLineDatas>) {
     println!("En attente de message");
-    rx.recv();
+    let kline_data = rx.recv().unwrap();
     println!("Message recu !");
 
     if data_dl_state.lock().unwrap().is_downloading_data.load(Ordering::Relaxed) {
@@ -205,7 +210,7 @@ fn kline_dl_manager(data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownload
     }
 
     println!("NO data file found, retreiving data from Binance server");
-    retreive_test_data(server_time, &market);
+    retreive_test_data(server_time, &market, kline_data);
     println!("Data retreived from the server.");
     data_dl_state.lock().unwrap().is_downloading_data.swap(false, Ordering::Relaxed);
 }
@@ -214,7 +219,7 @@ fn kline_dl_manager(data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownload
 fn rocket() -> _ {
     let state = Arc::new(std::sync::Mutex::new(DataDownloadingState { is_downloading_data: AtomicBool::new(false) }));
     let clone = state.clone();
-    let (tx, rx) = channel::<bool>();
+    let (tx, rx) = channel::<KLineDatas>();
 
     // Background processing thread
     thread::spawn(move || {
@@ -302,7 +307,7 @@ fn create_w_and_m_pattern_strategies(
     backtester.add_strategies(&mut strategies);
 }
 
-fn retreive_test_data(server_time: u64, market: &Market) -> Vec<KlineSummary> {
+fn retreive_test_data(server_time: u64, market: &Market, kline_data: KLineDatas) -> Vec<KlineSummary> {
     let mut i: u64 = 100;
     let start_i = i;
     let mut j = 0;
@@ -310,7 +315,7 @@ fn retreive_test_data(server_time: u64, market: &Market) -> Vec<KlineSummary> {
     let mut end_time = server_time - ((i - 1) * 60 * 1000 * 1000);
 
     let mut klines = Vec::new();
-    while let Ok(retreive_klines) = market.get_klines("BTCUSDT", "1m", 1000, start_time, end_time) {
+    while let Ok(retreive_klines) = market.get_klines(kline_data.symbol.clone(), kline_data.interval.clone(), 1000, start_time, end_time) {
         if i == 0 {
             break;
         }
@@ -329,7 +334,7 @@ fn retreive_test_data(server_time: u64, market: &Market) -> Vec<KlineSummary> {
     }
 
     let serialized = serde_json::to_string_pretty(&klines).unwrap();
-    let mut file = File::create(DATA_PATH).unwrap();
+    let mut file = File::create(format!("{}{}-{}.json", DATA_FOLDER, kline_data.symbol, kline_data.interval)).unwrap();
     file.write_all(serialized.as_bytes()).unwrap();
     klines
 }
