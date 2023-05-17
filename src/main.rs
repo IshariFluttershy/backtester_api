@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate rocket;
+extern crate queues;
 extern crate strategy_backtester;
 use binance::account::*;
 use binance::api::*;
@@ -10,6 +11,7 @@ use binance::market::Market;
 use binance::model::KlineSummaries;
 use binance::model::KlineSummary;
 use chrono::{Datelike, Timelike, Utc};
+use queues::*;
 use rocket::data;
 use rocket::tokio;
 use rocket::tokio::spawn;
@@ -47,10 +49,11 @@ pub struct DataDownloadingState {
 }
 
 pub struct DataDownloadingStateSender {
-    pub sender: std::sync::mpsc::Sender<KLineDatas>,
+    pub sender: std::sync::mpsc::Sender<KLineDatasId>,
 }
 
-pub struct KLineDatas {
+#[derive(Clone)]
+pub struct KLineDatasId {
     pub interval: String,
     pub symbol: String,
 }
@@ -82,19 +85,21 @@ pub async fn health_checker_handler() -> Result<Json<GenericResponse>, Status> {
 pub async fn test_handler(
     symbol: String,
     interval: String,
-    data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>,
 ) -> Result<Json<GenericResponse>, Status> {
-
     let klines;
-    if let Ok(content) = fs::read_to_string(format!(
-        "{}{}-{}.json",
-        DATA_FOLDER, symbol, interval
-    )) {
+    if let Ok(content) = fs::read_to_string(format!("{}{}-{}.json", DATA_FOLDER, symbol, interval))
+    {
         println!("data file found, deserializing");
         klines = serde_json::from_str(&content).unwrap();
         println!("deserializing finished");
     } else {
-        return Ok(Json(GenericResponse{ status: "error".to_string(), message: format!("There is no data. Download the corresponding data before. You sent {} - {}", symbol, interval),}));
+        return Ok(Json(GenericResponse {
+            status: "error".to_string(),
+            message: format!(
+                "There is no data. Download the corresponding data before. You sent {} - {}",
+                symbol, interval
+            ),
+        }));
     }
 
     let mut backtester = Backtester::new(klines, 64);
@@ -110,14 +115,14 @@ pub async fn test_handler(
             max: 1.,
             step: 1.,
         },
-        4,
-        4,
-        20,
-        20,
+        1,
+        10,
+        11,
+        50,
         ParamMultiplier {
-            min: 1.,
-            max: 1.,
-            step: 1.,
+            min: 0.5,
+            max: 10.,
+            step: 0.5,
         },
         MarketType::Spot,
     );
@@ -133,19 +138,25 @@ pub async fn test_handler(
 
     let results_json = serde_json::to_string_pretty(&results).unwrap();
     let mut file = File::create(
-        RESULTS_PATH.to_owned() + MONEY_EVOLUTION_PATH + generate_result_name().as_str(),
+        RESULTS_PATH.to_owned()
+            + MONEY_EVOLUTION_PATH
+            + generate_result_name(&symbol, &interval).as_str(),
     )
     .unwrap();
     file.write_all(results_json.as_bytes()).unwrap();
 
     results.iter_mut().for_each(|x| x.money_evolution.clear());
     let results_json = serde_json::to_string_pretty(&results).unwrap();
-    let mut file = File::create(RESULTS_PATH.to_owned() + generate_result_name().as_str()).unwrap();
+    let mut file =
+        File::create(RESULTS_PATH.to_owned() + generate_result_name(&symbol, &interval).as_str())
+            .unwrap();
     file.write_all(results_json.as_bytes()).unwrap();
 
     let affined_results_json = serde_json::to_string_pretty(&affined_results).unwrap();
     let mut file = File::create(
-        AFFINED_RESULTS_PATH.to_owned() + MONEY_EVOLUTION_PATH + generate_result_name().as_str(),
+        AFFINED_RESULTS_PATH.to_owned()
+            + MONEY_EVOLUTION_PATH
+            + generate_result_name(&symbol, &interval).as_str(),
     )
     .unwrap();
     file.write_all(affined_results_json.as_bytes()).unwrap();
@@ -154,11 +165,16 @@ pub async fn test_handler(
         .iter_mut()
         .for_each(|x| x.money_evolution.clear());
     let affined_results_json = serde_json::to_string_pretty(&affined_results).unwrap();
-    let mut file =
-        File::create(AFFINED_RESULTS_PATH.to_owned() + generate_result_name().as_str()).unwrap();
+    let mut file = File::create(
+        AFFINED_RESULTS_PATH.to_owned() + generate_result_name(&symbol, &interval).as_str(),
+    )
+    .unwrap();
     file.write_all(affined_results_json.as_bytes()).unwrap();
 
-    Ok(Json(GenericResponse{ status: "success".to_string(), message: format!("Strategy tested for {} - {}", symbol, interval),}))
+    Ok(Json(GenericResponse {
+        status: "success".to_string(),
+        message: format!("Strategy tested for {} - {}", symbol, interval),
+    }))
 }
 
 #[get("/dl?<symbol>&<interval>")]
@@ -168,76 +184,82 @@ pub async fn kline_data_dl_handler(
     data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>,
     sender_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingStateSender>>>,
 ) -> Result<Json<GenericResponse>, Status> {
+    let mut response_json = GenericResponse {
+        status: "success".to_string(),
+        message: format!("Downloading kline datas : {}-{}", symbol, interval),
+    };
     let is_downloading_data = data_dl_state
         .lock()
         .unwrap()
         .is_downloading_data
         .load(Ordering::Relaxed);
     if is_downloading_data {
-        return Ok(Json(GenericResponse {
-            status: "error".to_string(),
-            message: "Data is already downloading, wait for it to finish then try again"
-                .to_string(),
-        }));
+        response_json.message = format!(
+            "Already downloading datas. Queuing : {}-{}",
+            symbol, interval
+        );
     }
 
-    sender_state.lock().unwrap().sender.send(KLineDatas {
-        symbol,
-        interval,
-    });
-
-    let message: String = format!("Downloading kline datas : ");
-    let response_json = GenericResponse {
-        status: "success".to_string(),
-        message,
-    };
+    sender_state
+        .lock()
+        .unwrap()
+        .sender
+        .send(KLineDatasId { symbol, interval });
 
     Ok(Json(response_json))
 }
 
 fn kline_dl_manager(
     data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownloadingState>>,
-    rx: &Receiver<KLineDatas>,
+    rx: &Receiver<KLineDatasId>,
 ) {
-    println!("En attente de message");
-    let kline_data = rx.recv().unwrap();
-    println!("Message recu !");
-
-    if data_dl_state
-        .lock()
-        .unwrap()
-        .is_downloading_data
-        .load(Ordering::Relaxed)
-    {
-        return;
-    }
-    data_dl_state
-        .lock()
-        .unwrap()
-        .is_downloading_data
-        .swap(true, Ordering::Relaxed);
-
+    let dl_pool: Arc<std::sync::Mutex<Queue<KLineDatasId>>> =
+        Arc::new(std::sync::Mutex::new(queue![]));
+    let clone = dl_pool.clone();
     let market: Market = Binance::new(None, None);
     let general: General = Binance::new(None, None);
+    let data_dl_state = data_dl_state.clone();
 
-    let mut server_time = 0;
-    let result = general.get_server_time();
-    match result {
-        Ok(answer) => {
-            println!("Server Time: {}", answer.server_time);
-            server_time = answer.server_time;
+    thread::spawn(move || loop {
+        if clone.lock().unwrap().size() > 0 {
+            data_dl_state
+                .lock()
+                .unwrap()
+                .is_downloading_data
+                .swap(true, Ordering::Relaxed);
         }
-        Err(e) => println!("Error: {}", e),
-    }
 
-    println!("NO data file found, retreiving data from Binance server");
-    retreive_test_data(server_time, &market, kline_data);
-    println!("Data retreived from the server.");
-    data_dl_state
-        .lock()
-        .unwrap()
-        .is_downloading_data
-        .swap(false, Ordering::Relaxed);
+        while let Ok(id) = clone.lock().unwrap().remove() {
+            let mut server_time = 0;
+            let result = general.get_server_time();
+            match result {
+                Ok(answer) => {
+                    println!("Server Time: {}", answer.server_time);
+                    server_time = answer.server_time;
+                }
+                Err(e) => println!("Error: {}", e),
+            }
+
+            retreive_test_data(server_time, &market, id.clone());
+            println!(
+                "Data retreived from the server : {}-{}",
+                id.symbol, id.interval
+            );
+        }
+
+        data_dl_state
+            .lock()
+            .unwrap()
+            .is_downloading_data
+            .swap(false, Ordering::Relaxed);
+
+        thread::sleep(Duration::from_secs(10));
+    });
+
+    loop {
+        let kline_data = (rx).recv().unwrap();
+        dl_pool.lock().unwrap().add(kline_data);
+    }
 }
 
 #[launch]
@@ -246,10 +268,10 @@ fn rocket() -> _ {
         is_downloading_data: AtomicBool::new(false),
     }));
     let clone = state.clone();
-    let (tx, rx) = channel::<KLineDatas>();
+    let (tx, rx) = channel::<KLineDatasId>();
 
     // Background processing thread
-    thread::spawn(move || loop {
+    thread::spawn(move || {
         kline_dl_manager(&clone, &rx);
     });
 
@@ -337,7 +359,7 @@ fn create_w_and_m_pattern_strategies(
 fn retreive_test_data(
     server_time: u64,
     market: &Market,
-    kline_data: KLineDatas,
+    kline_data: KLineDatasId,
 ) -> Vec<KlineSummary> {
     let mut i: u64 = 100;
     let start_i = i;
@@ -380,10 +402,12 @@ fn retreive_test_data(
     klines
 }
 
-fn generate_result_name() -> String {
+fn generate_result_name(symbol: &String, interval: &String) -> String {
     let now = Utc::now();
     format!(
-        "{}_{}_{}_{}h{}m{}s.json",
+        "{}-{}_{}_{}_{}_{}h{}m{}s.json",
+        symbol,
+        interval,
         now.year(),
         now.month(),
         now.day(),
