@@ -78,35 +78,23 @@ pub async fn health_checker_handler() -> Result<Json<GenericResponse>, Status> {
     Ok(Json(response_json))
 }
 
-#[get("/test")]
+#[get("/test?<symbol>&<interval>")]
 pub async fn test_handler(
+    symbol: String,
+    interval: String,
     data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>,
 ) -> Result<Json<GenericResponse>, Status> {
-    let is_downloading_data = data_dl_state
-        .lock()
-        .unwrap()
-        .is_downloading_data
-        .swap(true, Ordering::Relaxed);
-    let message: String = format!("Hey ! Ca dl des datas ? : {}", is_downloading_data);
-
-    let response_json = GenericResponse {
-        status: "success".to_string(),
-        message,
-    };
-
-    data_dl_state
-        .lock()
-        .unwrap()
-        .is_downloading_data
-        .swap(true, Ordering::Relaxed);
 
     let klines;
-    if let Ok(content) = fs::read_to_string(DATA_PATH) {
+    if let Ok(content) = fs::read_to_string(format!(
+        "{}{}-{}.json",
+        DATA_FOLDER, symbol, interval
+    )) {
         println!("data file found, deserializing");
         klines = serde_json::from_str(&content).unwrap();
         println!("deserializing finished");
     } else {
-        return Err(Status::BadRequest);
+        return Ok(Json(GenericResponse{ status: "error".to_string(), message: format!("There is no data. Download the corresponding data before. You sent {} - {}", symbol, interval),}));
     }
 
     let mut backtester = Backtester::new(klines, 64);
@@ -170,7 +158,7 @@ pub async fn test_handler(
         File::create(AFFINED_RESULTS_PATH.to_owned() + generate_result_name().as_str()).unwrap();
     file.write_all(affined_results_json.as_bytes()).unwrap();
 
-    Ok(Json(response_json))
+    Ok(Json(GenericResponse{ status: "success".to_string(), message: format!("Strategy tested for {} - {}", symbol, interval),}))
 }
 
 #[get("/dl?<symbol>&<interval>")]
