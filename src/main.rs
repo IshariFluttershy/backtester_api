@@ -4,12 +4,15 @@ extern crate strategy_backtester;
 use binance::account::*;
 use binance::api::*;
 use binance::futures::account::*;
-use binance::futures::general::FuturesGeneral;
+use binance::general::General;
 use binance::futures::*;
 use binance::market::Market;
 use binance::model::KlineSummaries;
 use binance::model::KlineSummary;
 use chrono::{Datelike, Timelike, Utc};
+use rocket::data;
+use rocket::tokio;
+use rocket::tokio::sync::Mutex;
 use rocket::{get, http::Status, serde::json::Json};
 use serde::Serialize;
 use std::fs;
@@ -18,14 +21,23 @@ use std::io::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::thread;
+use std::time;
+use std::time::Duration;
 use strategy_backtester::backtest::*;
 use strategy_backtester::patterns::*;
 use strategy_backtester::strategies::*;
 use strategy_backtester::*;
 use std::sync::atomic::AtomicUsize;
 use rocket::State;
+use rocket::tokio::spawn;
+use std::sync::mpsc;
+use std::sync::mpsc::channel;
 
-const DATA_PATH: &str = "data/testdataPart.json";
+
+
+const DATA_PATH: &str = "data/testdataPartDL.json";
 const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
 const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
@@ -33,6 +45,10 @@ const START_MONEY: f64 = 100.;
 
 pub struct DataDownloadingState {
     pub is_downloading_data: AtomicBool
+}
+
+pub struct DataDownloadingStateSender {
+    pub sender: std::sync::mpsc::Sender<bool>
 }
 
 struct ParamMultiplier {
@@ -60,8 +76,8 @@ pub async fn health_checker_handler() -> Result<Json<GenericResponse>, Status> {
 }
 
 #[get("/test")]
-pub async fn test_handler(data_dl_state: &State<DataDownloadingState>) -> Result<Json<GenericResponse>, Status> {
-    let is_downloading_data = data_dl_state.is_downloading_data.swap(true, Ordering::Relaxed);
+pub async fn test_handler(data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>) -> Result<Json<GenericResponse>, Status> {
+    let is_downloading_data = data_dl_state.lock().unwrap().is_downloading_data.swap(true, Ordering::Relaxed);
     let message: String = format!("Hey ! Ca dl des datas ? : {}", is_downloading_data);
 
     let response_json = GenericResponse {
@@ -69,7 +85,7 @@ pub async fn test_handler(data_dl_state: &State<DataDownloadingState>) -> Result
         message,
     };
 
-    data_dl_state.is_downloading_data.swap(true, Ordering::Relaxed);
+    data_dl_state.lock().unwrap().is_downloading_data.swap(true, Ordering::Relaxed);
 
     let klines;
     if let Ok(content) = fs::read_to_string(DATA_PATH) {
@@ -144,11 +160,74 @@ pub async fn test_handler(data_dl_state: &State<DataDownloadingState>) -> Result
     Ok(Json(response_json))
 }
 
+#[get("/dl")]
+pub async fn kline_data_dl_handler(data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>, sender_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingStateSender>>>) -> Result<Json<GenericResponse>, Status> {
+    let is_downloading_data = data_dl_state.lock().unwrap().is_downloading_data.load(Ordering::Relaxed);
+    if is_downloading_data {
+        return Ok(Json(GenericResponse {
+            status: "error".to_string(),
+            message: "Data is already downloading, wait for it to finish then try again".to_string(),
+        }));
+    }
+    
+    sender_state.lock().unwrap().sender.send(true);
+
+    let message: String = format!("Downloading kline datas : ");
+    let response_json = GenericResponse {
+        status: "success".to_string(),
+        message,
+    };
+
+    Ok(Json(response_json))
+}
+
+fn kline_dl_manager(data_dl_state: &std::sync::Arc<std::sync::Mutex<DataDownloadingState>>, rx: &Receiver<bool>) {
+    println!("En attente de message");
+    rx.recv();
+    println!("Message recu !");
+
+    if data_dl_state.lock().unwrap().is_downloading_data.load(Ordering::Relaxed) {
+        return;
+    }
+    data_dl_state.lock().unwrap().is_downloading_data.swap(true, Ordering::Relaxed);
+
+    let market: Market = Binance::new(None, None);
+    let general: General = Binance::new(None, None);
+
+    let mut server_time = 0;
+    let result = general.get_server_time();
+    match result {
+        Ok(answer) => {
+            println!("Server Time: {}", answer.server_time);
+            server_time = answer.server_time;
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+
+    println!("NO data file found, retreiving data from Binance server");
+    retreive_test_data(server_time, &market);
+    println!("Data retreived from the server.");
+    data_dl_state.lock().unwrap().is_downloading_data.swap(false, Ordering::Relaxed);
+}
+
 #[launch]
 fn rocket() -> _ {
+    let state = Arc::new(std::sync::Mutex::new(DataDownloadingState { is_downloading_data: AtomicBool::new(false) }));
+    let clone = state.clone();
+    let (tx, rx) = channel::<bool>();
+
+    // Background processing thread
+    thread::spawn(move || {
+        loop {
+            kline_dl_manager(&clone, &rx);
+        }
+    });
+
+    let sender_state = Arc::new(std::sync::Mutex::new(DataDownloadingStateSender { sender: tx }));
     rocket::build()
-    .manage(DataDownloadingState { is_downloading_data: AtomicBool::new(false) })
-    .mount("/api", routes![health_checker_handler, test_handler,])
+    .manage(state)
+    .manage(sender_state)
+    .mount("/api", routes![health_checker_handler, test_handler, kline_data_dl_handler, ])
 }
 
 fn create_w_and_m_pattern_strategies(
