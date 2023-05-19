@@ -32,9 +32,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time;
 use std::time::Duration;
+use std::time::Instant;
 use strategy_backtester::backtest::*;
 use strategy_backtester::patterns::*;
 use strategy_backtester::strategies::*;
+use strategy_backtester::strategies_creator::*;
 use strategy_backtester::*;
 
 const DATA_FOLDER: &str = "data/";
@@ -43,6 +45,8 @@ const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
 const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
 const START_MONEY: f64 = 100.;
+const WORKERS: usize = 8;
+
 
 pub struct DataDownloadingState {
     pub is_downloading_data: AtomicBool,
@@ -56,12 +60,6 @@ pub struct DataDownloadingStateSender {
 pub struct KLineDatasId {
     pub interval: String,
     pub symbol: String,
-}
-
-struct ParamMultiplier {
-    min: f64,
-    max: f64,
-    step: f64,
 }
 
 #[derive(Serialize)]
@@ -86,7 +84,7 @@ pub async fn test_handler(
     symbol: String,
     interval: String,
 ) -> Result<Json<GenericResponse>, Status> {
-    let klines;
+    let klines: Vec<KlineSummary>;
     if let Ok(content) = fs::read_to_string(format!("{}{}-{}.json", DATA_FOLDER, symbol, interval))
     {
         println!("data file found, deserializing");
@@ -102,34 +100,79 @@ pub async fn test_handler(
         }));
     }
 
-    let mut backtester = Backtester::new(klines, 64);
-    create_w_and_m_pattern_strategies(
-        &mut backtester,
+    let strategies = create_w_and_m_pattern_strategies(
+        START_MONEY,
         ParamMultiplier {
-            min: 2.,
-            max: 2.,
+            min: 0.5,
+            max: 4.,
             step: 1.,
+        },
+        ParamMultiplier {
+            min: 0.2,
+            max: 2.,
+            step: 0.2,
+        },
+        ParamMultiplier {
+            min: 1,
+            max: 1,
+            step: 1
+        },
+        ParamMultiplier {
+            min: 10,
+            max: 30,
+            step: 5
         },
         ParamMultiplier {
             min: 1.,
             max: 1.,
             step: 1.,
         },
-        1,
-        10,
-        11,
-        50,
-        ParamMultiplier {
-            min: 0.5,
-            max: 10.,
-            step: 0.5,
-        },
-        MarketType::Spot,
+        MarketType::Spot
     );
-    backtester.start();
+
+    println!("{} strategies to test", strategies.len());
+    let start = Instant::now();
+
+    let mut threads_results = Vec::new();
+    let chunk_size = (strategies.len() + WORKERS - 1) / WORKERS;
+    for i in 0..WORKERS {
+        let start = i * chunk_size;
+        let mut num_elements = if i < WORKERS - 1 {
+            chunk_size
+        } else if i * chunk_size <= strategies.len() {
+            strategies.len() - i * chunk_size
+        } else {
+            break;
+        };
+        
+        if start >= strategies.len() {
+            break;
+        } else if start + num_elements >= strategies.len() {
+            num_elements = strategies.len() - start;
+        }
+
+        println!("Worker n {} -- start = {} -- num_elements = {} -- chunk-size = {}", i, start, num_elements, chunk_size);
+        let mut chunk = Vec::from(&strategies[start..][..num_elements]);
+        
+        let klines_clone = klines.clone();
+        let result = thread::spawn(move || {
+            Backtester::new(klines_clone, 1)
+            .add_strategies(&mut chunk)
+            .start()
+            .get_results()
+        });
+        threads_results.push(result);
+    }
+
+    let mut results = Vec::new();
+    for result in threads_results {
+        results.append(&mut result.join().unwrap());
+    }
+    println!("Strategies result = {}", results.len());
+    let duration = start.elapsed();
+    println!("Elapsed total time : {}s", duration.as_secs());
     println!();
 
-    let mut results = backtester.get_results();
     let mut affined_results: Vec<StrategyResult> = results
         .iter()
         .filter(|x| x.total_closed > 100)
@@ -282,78 +325,6 @@ fn rocket() -> _ {
         "/api",
         routes![health_checker_handler, test_handler, kline_data_dl_handler,],
     )
-}
-
-fn create_w_and_m_pattern_strategies(
-    backtester: &mut Backtester,
-    tp: ParamMultiplier,
-    sl: ParamMultiplier,
-    min_klines_repetitions: usize,
-    max_klines_repetitions: usize,
-    min_klines_range: usize,
-    max_klines_range: usize,
-    risk: ParamMultiplier,
-    market_type: MarketType,
-) {
-    let mut strategies: Vec<Strategy> = Vec::new();
-    let mut i = tp.min;
-    while i <= tp.max {
-        let mut j = sl.min;
-        while j <= sl.max {
-            for k in min_klines_repetitions..=max_klines_repetitions {
-                for l in min_klines_range..=max_klines_range {
-                    let mut m = risk.min;
-                    while m <= risk.max {
-                        let pattern_params_w: Vec<Arc<dyn PatternParams>> =
-                            vec![Arc::new(WPatternParams {
-                                klines_repetitions: k,
-                                klines_range: l,
-                                name: PatternName::W,
-                            })];
-
-                        let pattern_params_m: Vec<Arc<dyn PatternParams>> =
-                            vec![Arc::new(MPatternParams {
-                                klines_repetitions: k,
-                                klines_range: l,
-                                name: PatternName::M,
-                            })];
-
-                        strategies.push((
-                            strategies::create_wpattern_trades,
-                            StrategyParams {
-                                tp_multiplier: i,
-                                sl_multiplier: j,
-                                risk_per_trade: m * 0.01,
-                                money: START_MONEY,
-                                name: StrategyName::W,
-                                market_type,
-                            },
-                            Arc::new(pattern_params_w),
-                        ));
-
-                        /*strategies.push((
-                            strategies::create_mpattern_trades,
-                            StrategyParams {
-                                tp_multiplier: i,
-                                sl_multiplier: j,
-                                risk_per_trade: m * 0.01,
-                                money: START_MONEY,
-                                name: StrategyName::M,
-                                market_type
-                            },
-                            Arc::new(pattern_params_m),
-                        ));*/
-                        m += risk.step;
-                    }
-                }
-            }
-            j += sl.step;
-        }
-
-        i += tp.step;
-    }
-
-    backtester.add_strategies(&mut strategies);
 }
 
 fn retreive_test_data(
