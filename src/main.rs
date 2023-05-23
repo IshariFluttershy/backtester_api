@@ -21,6 +21,7 @@ use rocket::{get, http::Status, serde::json::Json};
 use serde::Serialize;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::prelude::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -45,11 +46,15 @@ const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
 const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
 const START_MONEY: f64 = 100.;
-const WORKERS: usize = 8;
+const WORKERS: usize = 20;
 
 
 pub struct DataDownloadingState {
     pub is_downloading_data: AtomicBool,
+}
+
+pub struct TestingState {
+    pub is_testing: AtomicBool,
 }
 
 pub struct DataDownloadingStateSender {
@@ -83,7 +88,18 @@ pub async fn health_checker_handler() -> Result<Json<GenericResponse>, Status> {
 pub async fn test_handler(
     symbol: String,
     interval: String,
+    state: &State<TestingState>,
 ) -> Result<Json<GenericResponse>, Status> {
+    let is_testing = state.is_testing.load(Ordering::Acquire);
+    if is_testing {
+        return Ok(Json(GenericResponse {
+            status: "error".to_string(),
+            message: "Strategy is already testing".to_string(),
+        }));
+    } else if !is_testing{
+        state.is_testing.swap(true, Ordering::Relaxed);
+    }
+
     let klines: Vec<KlineSummary>;
     if let Ok(content) = fs::read_to_string(format!("{}{}-{}.json", DATA_FOLDER, symbol, interval))
     {
@@ -103,23 +119,23 @@ pub async fn test_handler(
     let strategies = create_w_and_m_pattern_strategies(
         START_MONEY,
         ParamMultiplier {
-            min: 0.5,
-            max: 4.,
+            min: 2.,
+            max: 2.,
             step: 1.,
         },
         ParamMultiplier {
-            min: 0.2,
-            max: 2.,
-            step: 0.2,
+            min: 1.,
+            max: 1.,
+            step: 2.,
         },
         ParamMultiplier {
-            min: 1,
-            max: 1,
+            min: 3,
+            max: 3,
             step: 1
         },
         ParamMultiplier {
-            min: 10,
-            max: 30,
+            min: 25,
+            max: 25,
             step: 5
         },
         ParamMultiplier {
@@ -132,9 +148,12 @@ pub async fn test_handler(
 
     println!("{} strategies to test", strategies.len());
     let start = Instant::now();
+    let readable_klines = Backtester::to_all_math_kline(klines);
+    let arc_klines = Arc::new(readable_klines);
 
     let mut threads_results = Vec::new();
     let chunk_size = (strategies.len() + WORKERS - 1) / WORKERS;
+    let (tx, rx) = channel::<(f32, usize)>();
     for i in 0..WORKERS {
         let start = i * chunk_size;
         let mut num_elements = if i < WORKERS - 1 {
@@ -153,10 +172,11 @@ pub async fn test_handler(
 
         println!("Worker n {} -- start = {} -- num_elements = {} -- chunk-size = {}", i, start, num_elements, chunk_size);
         let mut chunk = Vec::from(&strategies[start..][..num_elements]);
-        
-        let klines_clone = klines.clone();
+        let tx_clone = tx.clone();
+
+        let arc_klines_clone = arc_klines.clone();
         let result = thread::spawn(move || {
-            Backtester::new(klines_clone, 1)
+            Backtester::new(arc_klines_clone, tx_clone, i)
             .add_strategies(&mut chunk)
             .start()
             .get_results()
@@ -165,9 +185,33 @@ pub async fn test_handler(
     }
 
     let mut results = Vec::new();
+    let mut trackers: Vec<f32> = vec![];
+    for i in 0..threads_results.len() {
+        trackers.push(0.);
+    }
+    let mut duration = Duration::new(0, 0);
+    let mut last_display = 0;
+    let num_of_threads = threads_results.len() as f32;
+
     for result in threads_results {
+        while !result.is_finished() {
+            if let Ok((done, id)) = rx.recv_timeout(Duration::new(1, 0)) {
+                trackers[id] = done;
+                duration = start.elapsed();
+                if last_display + 1000 < duration.as_millis() {
+                    print!("\rTotal done : {:.2}% -- Elapsed time : {}s -- Estimated total time : {}s                     ", (trackers.iter().sum::<f32>()/num_of_threads), duration.as_secs(), (100./(trackers.iter().sum::<f32>()/num_of_threads) * (duration.as_secs() as f32)) as u32);
+                    io::stdout().flush().unwrap();
+                    last_display = duration.as_millis();
+                }
+            } else {
+                print!("\rTotal done : {:.2}% -- Elapsed time : {}s -- Estimated total time : {}s                             ", (trackers.iter().sum::<f32>()/num_of_threads), duration.as_secs(), (100./(trackers.iter().sum::<f32>()/num_of_threads) * (duration.as_secs() as f32)) as u32);
+                io::stdout().flush().unwrap();
+                last_display = duration.as_millis();
+            }
+        }
         results.append(&mut result.join().unwrap());
     }
+    println!();
     println!("Strategies result = {}", results.len());
     let duration = start.elapsed();
     println!("Elapsed total time : {}s", duration.as_secs());
@@ -213,6 +257,8 @@ pub async fn test_handler(
     )
     .unwrap();
     file.write_all(affined_results_json.as_bytes()).unwrap();
+
+    state.is_testing.swap(false, Ordering::Release);
 
     Ok(Json(GenericResponse {
         status: "success".to_string(),
@@ -321,7 +367,10 @@ fn rocket() -> _ {
     let sender_state = Arc::new(std::sync::Mutex::new(DataDownloadingStateSender {
         sender: tx,
     }));
-    rocket::build().manage(state).manage(sender_state).mount(
+    let test_state = TestingState {
+        is_testing: false.into(),
+    };
+    rocket::build().manage(state).manage(sender_state).manage(test_state).mount(
         "/api",
         routes![health_checker_handler, test_handler, kline_data_dl_handler,],
     )
@@ -332,7 +381,7 @@ fn retreive_test_data(
     market: &Market,
     kline_data: KLineDatasId,
 ) -> Vec<KlineSummary> {
-    let mut i: u64 = 100;
+    let mut i: u64 = 10000;
     let start_i = i;
     let mut j = 0;
     let mut start_time = server_time - (i * 60 * 1000 * 1000);
