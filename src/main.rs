@@ -19,6 +19,7 @@ use rocket::tokio::sync::Mutex;
 use rocket::State;
 use rocket::{get, http::Status, serde::json::Json};
 use serde::Serialize;
+use strategy_backtester::tools::retreive_test_data;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -48,7 +49,6 @@ const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
 const START_MONEY: f64 = 100.;
 const WORKERS: usize = 20;
 
-
 pub struct DataDownloadingState {
     pub is_downloading_data: AtomicBool,
 }
@@ -59,6 +59,21 @@ pub struct TestingState {
 
 pub struct DataDownloadingStateSender {
     pub sender: std::sync::mpsc::Sender<KLineDatasId>,
+}
+
+pub struct TestingStateSender {
+    pub sender: std::sync::mpsc::Sender<BacktesterDatas>,
+}
+
+#[derive(Clone)]
+pub struct BacktesterDatas {
+    pub data_id: KLineDatasId,
+    pub tp: ParamMultiplier<f64>,
+    pub sl: ParamMultiplier<f64>,
+    pub kline_repetition: ParamMultiplier<usize>,
+    pub kline_range: ParamMultiplier<usize>,
+    pub risk: ParamMultiplier<f64>,
+    pub market_type: MarketType,
 }
 
 #[derive(Clone)]
@@ -96,7 +111,7 @@ pub async fn test_handler(
             status: "error".to_string(),
             message: "Strategy is already testing".to_string(),
         }));
-    } else if !is_testing{
+    } else if !is_testing {
         state.is_testing.swap(true, Ordering::Relaxed);
     }
 
@@ -131,19 +146,19 @@ pub async fn test_handler(
         ParamMultiplier {
             min: 3,
             max: 3,
-            step: 1
+            step: 1,
         },
         ParamMultiplier {
             min: 25,
             max: 25,
-            step: 5
+            step: 5,
         },
         ParamMultiplier {
             min: 1.,
             max: 1.,
             step: 1.,
         },
-        MarketType::Spot
+        MarketType::Spot,
     );
 
     println!("{} strategies to test", strategies.len());
@@ -163,23 +178,26 @@ pub async fn test_handler(
         } else {
             break;
         };
-        
+
         if start >= strategies.len() {
             break;
         } else if start + num_elements >= strategies.len() {
             num_elements = strategies.len() - start;
         }
 
-        println!("Worker n {} -- start = {} -- num_elements = {} -- chunk-size = {}", i, start, num_elements, chunk_size);
+        println!(
+            "Worker n {} -- start = {} -- num_elements = {} -- chunk-size = {}",
+            i, start, num_elements, chunk_size
+        );
         let mut chunk = Vec::from(&strategies[start..][..num_elements]);
         let tx_clone = tx.clone();
 
         let arc_klines_clone = arc_klines.clone();
         let result = thread::spawn(move || {
-            Backtester::new(arc_klines_clone, tx_clone, i)
-            .add_strategies(&mut chunk)
-            .start()
-            .get_results()
+            Backtester::new(arc_klines_clone, Some(tx_clone), Some(i))
+                .add_strategies(&mut chunk)
+                .start()
+                .get_results()
         });
         threads_results.push(result);
     }
@@ -266,6 +284,43 @@ pub async fn test_handler(
     }))
 }
 
+fn test_manager(
+    test_state: &std::sync::Arc<std::sync::Mutex<TestingState>>,
+    rx: &Receiver<BacktesterDatas>,
+) {
+    let test_pool: Arc<std::sync::Mutex<Queue<BacktesterDatas>>> =
+        Arc::new(std::sync::Mutex::new(queue![]));
+    let clone = test_pool.clone();
+    let test_state = test_state.clone();
+
+    thread::spawn(move || loop {
+        if clone.lock().unwrap().size() > 0 {
+            test_state
+                .lock()
+                .unwrap()
+                .is_testing
+                .swap(true, Ordering::Relaxed);
+        }
+
+        while let Ok(id) = clone.lock().unwrap().remove() {
+
+        }
+
+        test_state
+            .lock()
+            .unwrap()
+            .is_testing
+            .swap(false, Ordering::Relaxed);
+
+        thread::sleep(Duration::from_secs(10));
+    });
+
+    loop {
+        let backtest_data = (rx).recv().unwrap();
+        test_pool.lock().unwrap().add(backtest_data);
+    }
+}
+
 #[get("/dl?<symbol>&<interval>")]
 pub async fn kline_data_dl_handler(
     symbol: String,
@@ -329,7 +384,7 @@ fn kline_dl_manager(
                 Err(e) => println!("Error: {}", e),
             }
 
-            retreive_test_data(server_time, &market, id.clone());
+            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 10000, 1000);
             println!(
                 "Data retreived from the server : {}-{}",
                 id.symbol, id.interval
@@ -353,73 +408,45 @@ fn kline_dl_manager(
 
 #[launch]
 fn rocket() -> _ {
-    let state = Arc::new(std::sync::Mutex::new(DataDownloadingState {
+    let dl_state = Arc::new(std::sync::Mutex::new(DataDownloadingState {
         is_downloading_data: AtomicBool::new(false),
     }));
-    let clone = state.clone();
+    let test_state = Arc::new(std::sync::Mutex::new(TestingState {
+        is_testing: AtomicBool::new(false),
+    }));
+    let dl_clone = dl_state.clone();
+    let test_clone = test_state.clone();
+
     let (tx, rx) = channel::<KLineDatasId>();
+    let (backtest_tx, backtest_rx) = channel::<BacktesterDatas>();
 
     // Background processing thread
     thread::spawn(move || {
-        kline_dl_manager(&clone, &rx);
+        kline_dl_manager(&dl_clone, &rx);
     });
 
-    let sender_state = Arc::new(std::sync::Mutex::new(DataDownloadingStateSender {
+    thread::spawn(move || {
+        test_manager(&test_clone, &backtest_rx);
+    });
+
+    let dl_sender_state = Arc::new(std::sync::Mutex::new(DataDownloadingStateSender {
         sender: tx,
+    }));
+    let backtest_sender_state = Arc::new(std::sync::Mutex::new(TestingStateSender {
+        sender: backtest_tx,
     }));
     let test_state = TestingState {
         is_testing: false.into(),
     };
-    rocket::build().manage(state).manage(sender_state).manage(test_state).mount(
-        "/api",
-        routes![health_checker_handler, test_handler, kline_data_dl_handler,],
-    )
-}
-
-fn retreive_test_data(
-    server_time: u64,
-    market: &Market,
-    kline_data: KLineDatasId,
-) -> Vec<KlineSummary> {
-    let mut i: u64 = 10000;
-    let start_i = i;
-    let mut j = 0;
-    let mut start_time = server_time - (i * 60 * 1000 * 1000);
-    let mut end_time = server_time - ((i - 1) * 60 * 1000 * 1000);
-
-    let mut klines = Vec::new();
-    while let Ok(retreive_klines) = market.get_klines(
-        kline_data.symbol.clone(),
-        kline_data.interval.clone(),
-        1000,
-        start_time,
-        end_time,
-    ) {
-        if i == 0 {
-            break;
-        }
-        if let KlineSummaries::AllKlineSummaries(mut retreived_vec) = retreive_klines {
-            klines.append(&mut retreived_vec);
-        }
-
-        start_time = end_time + 1000 * 60;
-        end_time = start_time + 60 * 1000 * 1000;
-
-        i -= 1;
-        j += 1;
-        if i % 10 == 0 {
-            println!("Retreived {}/{} bench of klines data", j, start_i);
-        }
-    }
-
-    let serialized = serde_json::to_string_pretty(&klines).unwrap();
-    let mut file = File::create(format!(
-        "{}{}-{}.json",
-        DATA_FOLDER, kline_data.symbol, kline_data.interval
-    ))
-    .unwrap();
-    file.write_all(serialized.as_bytes()).unwrap();
-    klines
+    rocket::build()
+        .manage(dl_state)
+        .manage(dl_sender_state)
+        .manage(test_state)
+        .manage(backtest_sender_state)
+        .mount(
+            "/api",
+            routes![health_checker_handler, test_handler, kline_data_dl_handler,],
+        )
 }
 
 fn generate_result_name(symbol: &String, interval: &String) -> String {
