@@ -85,7 +85,6 @@ checksum = "a4a4ddaa51a5bc52a6948f74c06d20aaaddb71924eab79b8c97a8c556e942d6a"
 [[package]]
 name = "binance"
 version = "0.20.2"
-source = "git+https://github.com/wisespace-io/binance-rs.git#fd227c80e5992dbc8182afa951f112806ed4e5f7"
 dependencies = [
  "error-chain",
  "hex",
