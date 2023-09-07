@@ -46,7 +46,7 @@ const DATA_PATH: &str = "data/testdataPartDL.json";
 const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
 const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
-const START_MONEY: f64 = 100.;
+const START_MONEY: f64 = 20.;
 const WORKERS: usize = 20;
 
 pub struct DataDownloadingState {
@@ -105,6 +105,7 @@ pub async fn test_handler(
     interval: String,
     state: &State<TestingState>,
 ) -> Result<Json<GenericResponse>, Status> {
+    let symbol = symbol.to_uppercase();
     let is_testing = state.is_testing.load(Ordering::Acquire);
     if is_testing {
         return Ok(Json(GenericResponse {
@@ -135,22 +136,22 @@ pub async fn test_handler(
         START_MONEY,
         ParamMultiplier {
             min: 2.,
-            max: 2.,
-            step: 1.,
+            max: 4.,
+            step: 2.,
         },
         ParamMultiplier {
             min: 1.,
             max: 1.,
-            step: 2.,
+            step: 0.5,
         },
         ParamMultiplier {
             min: 3,
-            max: 3,
+            max: 4,
             step: 1,
         },
         ParamMultiplier {
-            min: 25,
-            max: 25,
+            min: 40,
+            max: 40,
             step: 5,
         },
         ParamMultiplier {
@@ -194,7 +195,7 @@ pub async fn test_handler(
 
         let arc_klines_clone = arc_klines.clone();
         let result = thread::spawn(move || {
-            Backtester::new(arc_klines_clone, Some(tx_clone), Some(i))
+            Backtester::new(arc_klines_clone, Some(tx_clone), Some(i), false)
                 .add_strategies(&mut chunk)
                 .start()
                 .get_results()
@@ -328,6 +329,7 @@ pub async fn kline_data_dl_handler(
     data_dl_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingState>>>,
     sender_state: &State<std::sync::Arc<std::sync::Mutex<DataDownloadingStateSender>>>,
 ) -> Result<Json<GenericResponse>, Status> {
+    let symbol = symbol.to_uppercase();
     let mut response_json = GenericResponse {
         status: "success".to_string(),
         message: format!("Downloading kline datas : {}-{}", symbol, interval),
@@ -384,7 +386,7 @@ fn kline_dl_manager(
                 Err(e) => println!("Error: {}", e),
             }
 
-            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 10000, 1000);
+            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 44, 1000, true);
             println!(
                 "Data retreived from the server : {}-{}",
                 id.symbol, id.interval
