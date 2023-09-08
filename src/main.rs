@@ -132,11 +132,11 @@ pub async fn test_handler(
         }));
     }
 
-    let strategies = create_w_and_m_pattern_strategies(
+    let strategies = create_m_pattern_strategies(
         START_MONEY,
         ParamMultiplier {
             min: 2.,
-            max: 4.,
+            max: 2.,
             step: 2.,
         },
         ParamMultiplier {
@@ -145,8 +145,8 @@ pub async fn test_handler(
             step: 0.5,
         },
         ParamMultiplier {
-            min: 3,
-            max: 4,
+            min: 5,
+            max: 5,
             step: 1,
         },
         ParamMultiplier {
@@ -386,7 +386,7 @@ fn kline_dl_manager(
                 Err(e) => println!("Error: {}", e),
             }
 
-            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 44, 1000, true);
+            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 1, 1000, true);
             println!(
                 "Data retreived from the server : {}-{}",
                 id.symbol, id.interval
