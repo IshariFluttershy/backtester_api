@@ -145,13 +145,13 @@ pub async fn test_handler(
             step: 0.5,
         },
         ParamMultiplier {
-            min: 5,
-            max: 5,
+            min: 3,
+            max: 3,
             step: 1,
         },
         ParamMultiplier {
-            min: 40,
-            max: 40,
+            min: 25,
+            max: 25,
             step: 5,
         },
         ParamMultiplier {
