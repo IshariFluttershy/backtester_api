@@ -135,18 +135,18 @@ pub async fn test_handler(
     let strategies = create_m_pattern_strategies(
         START_MONEY,
         ParamMultiplier {
-            min: 2.,
-            max: 2.,
-            step: 2.,
+            min: 1.,
+            max: 6.,
+            step: 1.,
         },
         ParamMultiplier {
-            min: 1.,
-            max: 1.,
+            min: 0.5,
+            max: 2.,
             step: 0.5,
         },
         ParamMultiplier {
-            min: 3,
-            max: 3,
+            min: 2,
+            max: 5,
             step: 1,
         },
         ParamMultiplier {
@@ -386,7 +386,7 @@ fn kline_dl_manager(
                 Err(e) => println!("Error: {}", e),
             }
 
-            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 1, 1000, true);
+            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 5000, 1000, true);
             println!(
                 "Data retreived from the server : {}-{}",
                 id.symbol, id.interval
