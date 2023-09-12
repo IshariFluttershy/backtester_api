@@ -46,7 +46,7 @@ const DATA_PATH: &str = "data/testdataPartDL.json";
 const RESULTS_PATH: &str = "results/full/";
 const AFFINED_RESULTS_PATH: &str = "results/affined/";
 const MONEY_EVOLUTION_PATH: &str = "withMoneyEvolution/";
-const START_MONEY: f64 = 20.;
+const START_MONEY: f64 = 1000.;
 const WORKERS: usize = 20;
 
 pub struct DataDownloadingState {
@@ -132,7 +132,7 @@ pub async fn test_handler(
         }));
     }
 
-    let strategies = create_m_pattern_strategies(
+    let strategies = create_w_and_m_pattern_strategies(
         START_MONEY,
         ParamMultiplier {
             min: 1.,
@@ -386,7 +386,7 @@ fn kline_dl_manager(
                 Err(e) => println!("Error: {}", e),
             }
 
-            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 5000, 1000, true);
+            retreive_test_data(server_time, &market, id.symbol.clone(), id.interval.clone(), DATA_FOLDER.to_string(), 1, 1000, true);
             println!(
                 "Data retreived from the server : {}-{}",
                 id.symbol, id.interval
